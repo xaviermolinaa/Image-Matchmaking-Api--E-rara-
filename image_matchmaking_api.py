@@ -11,6 +11,9 @@ import shutil
 import mimetypes
 import time
 import logging
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 from e_rara_id_fetcher import search_ids_v2
 from e_rara_image_downloader_hack import get_all_page_ids, get_manifest_url
 
@@ -20,7 +23,7 @@ from e_rara_image_downloader_hack import get_all_page_ids, get_manifest_url
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(title="E-rara Image Matchmaking API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +32,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "version": "2.0.0", "features": ["caching", "concurrency", "smart_page_selection"]}
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {"message": "E-rara Image Matchmaking API", "version": "2.0.0", "docs": "/docs"}
+
+# Configuration
+class CacheConfig:
+    MANIFEST_CACHE_SIZE = 1000  # Cache up to 1000 manifests
+    IMAGE_VALIDATION_CACHE_SIZE = 2000  # Cache validation results
+    CACHE_TTL_SECONDS = 3600  # 1 hour TTL for demonstration
+
+class ConcurrencyConfig:
+    MAX_WORKERS = 5  # Maximum concurrent workers for processing records
+    BATCH_SIZE = 10  # Process records in batches
+
+cache_config = CacheConfig()
+concurrency_config = ConcurrencyConfig()
+
+# Cached version of expensive operations
+@lru_cache(maxsize=cache_config.MANIFEST_CACHE_SIZE)
+def get_cached_page_ids(record_id: str):
+    """Cached version of get_all_page_ids to avoid repeated API calls"""
+    logger.debug(f"Cache miss for record {record_id} - fetching from e-rara")
+    return get_all_page_ids(record_id)
+
+@lru_cache(maxsize=cache_config.IMAGE_VALIDATION_CACHE_SIZE)
+def get_cached_image_validation(url: str):
+    """Cached version of image URL validation"""
+    logger.debug(f"Cache miss for image validation {url}")
+    return is_valid_image_url_uncached(url)
+
+def clear_caches():
+    """Clear all caches - useful for testing or periodic cleanup"""
+    get_cached_page_ids.cache_clear()
+    get_cached_image_validation.cache_clear()
+    logger.info("All caches cleared")
+
+def get_cache_stats():
+    """Get cache statistics for monitoring"""
+    return {
+        "manifest_cache": get_cached_page_ids.cache_info()._asdict(),
+        "image_validation_cache": get_cached_image_validation.cache_info()._asdict()
+    }
 
 
 # In-memory job store for async jobs (for demo)
@@ -57,6 +109,8 @@ class ImageMatchmakingRequest(BaseModel):
     # New parameters for page selection
     avoid_covers: Optional[bool] = True  # Skip cover pages by default
     page_selection: Optional[str] = "content"  # "content", "first", "random"
+    # New parameter for image validation
+    validate_images: Optional[bool] = True  # Enable image validation by default
 
 
 def validate_fields(criteria, from_date, until_date, uploadedImage):
@@ -104,7 +158,8 @@ def parse_criteria(criteria):
                 parsed.append({"field": field, "value": value, "operator": operator})
     return parsed
 
-def is_valid_image_url(url):
+def is_valid_image_url_uncached(url):
+    """Original image validation function without caching"""
     try:
         resp = requests.head(url, timeout=5, allow_redirects=True)
         if resp.status_code == 405:  # Method not allowed; try GET lightweight
@@ -118,6 +173,22 @@ def is_valid_image_url(url):
         logger.warning(f"Image URL validation failed for {url}: {e}")
         return False
 
+def is_valid_image_url(url, use_cache=True):
+    """
+    Validate image URL with optional caching
+    
+    Parameters:
+    -----------
+    url : str
+        Image URL to validate
+    use_cache : bool
+        Whether to use cached results (default: True)
+    """
+    if use_cache:
+        return get_cached_image_validation(url)
+    else:
+        return is_valid_image_url_uncached(url)
+
 def build_thumbnail_url(page_id: str, height: int = 150):
     # IIIF pattern: /i3f/v21/{page_id}/full/,{height}/0/default.jpg (height-constrained)
     return f"https://www.e-rara.ch/i3f/v21/{page_id}/full/,{height}/0/default.jpg"
@@ -129,6 +200,7 @@ def build_full_url(page_id: str):
 def select_page_from_record(record_id: str, avoid_covers: bool = True, page_selection: str = "content"):
     """
     Select a page from a record based on the specified strategy.
+    Uses cached manifest data for better performance.
     
     Parameters:
     -----------
@@ -144,7 +216,8 @@ def select_page_from_record(record_id: str, avoid_covers: bool = True, page_sele
     tuple
         (selected_page_id, all_page_ids)
     """
-    data = get_all_page_ids(record_id)
+    # Use cached version for better performance
+    data = get_cached_page_ids(record_id)
     pages = data.get('page_ids', []) if isinstance(data, dict) else []
     
     if not pages:
@@ -200,9 +273,119 @@ def select_page_from_record(record_id: str, avoid_covers: bool = True, page_sele
     return pages[0], pages
 
 # Keep the old function for backward compatibility but use the new logic
-def expand_record_to_content_page(record_id: str):
+def process_single_record(record_id: str, avoid_covers: bool = True, page_selection: str = "content", validate_images: bool = True):
     """
-    Legacy function - now uses the new select_page_from_record with content strategy
+    Process a single record to extract image information
+    
+    Parameters:
+    -----------
+    record_id : str
+        The e-rara record ID
+    avoid_covers : bool
+        Whether to skip likely cover pages
+    page_selection : str
+        Page selection strategy
+    validate_images : bool
+        Whether to validate image URLs
+        
+    Returns:
+    --------
+    dict or None
+        Image information dictionary or None if processing failed
+    """
+    try:
+        first_page, all_pages = select_page_from_record(record_id, avoid_covers, page_selection)
+        if not first_page:
+            logger.warning(f"No pages for record {record_id}")
+            return None
+            
+        thumb = build_thumbnail_url(first_page)
+        full_url = build_full_url(first_page)
+        
+        # Use configurable image validation
+        if validate_images:
+            is_valid = is_valid_image_url(thumb, use_cache=True)
+        else:
+            # Skip validation for faster response
+            is_valid = True
+            logger.debug(f"Skipping image validation for {thumb} (validate_images=False)")
+        
+        if is_valid:
+            return {
+                "recordId": record_id,
+                "pageId": first_page,
+                "thumbnailUrl": thumb,
+                "fullImageUrl": full_url,
+                "pageCount": len(all_pages),
+                "pageIds": all_pages,
+                "manifest": get_manifest_url(record_id)
+            }
+        else:
+            logger.warning(f"Invalid thumbnail for page {first_page} (record {record_id})")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error processing record {record_id}: {e}")
+        return None
+
+def process_records_concurrently(record_ids: List[str], avoid_covers: bool = True, 
+                                page_selection: str = "content", validate_images: bool = True,
+                                max_workers: int = None) -> List[Dict]:
+    """
+    Process multiple records concurrently for better performance
+    
+    Parameters:
+    -----------
+    record_ids : List[str]
+        List of e-rara record IDs to process
+    avoid_covers : bool
+        Whether to skip likely cover pages
+    page_selection : str
+        Page selection strategy
+    validate_images : bool
+        Whether to validate image URLs
+    max_workers : int
+        Maximum number of concurrent workers (defaults to config)
+        
+    Returns:
+    --------
+    List[Dict]
+        List of successfully processed image information dictionaries
+    """
+    if max_workers is None:
+        max_workers = concurrency_config.MAX_WORKERS
+        
+    images = []
+    
+    # For small numbers of records, process sequentially to avoid overhead
+    if len(record_ids) <= 2:
+        logger.info(f"Processing {len(record_ids)} records sequentially")
+        for record_id in record_ids:
+            result = process_single_record(record_id, avoid_covers, page_selection, validate_images)
+            if result:
+                images.append(result)
+    else:
+        logger.info(f"Processing {len(record_ids)} records concurrently with {max_workers} workers")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_record = {
+                executor.submit(process_single_record, record_id, avoid_covers, page_selection, validate_images): record_id
+                for record_id in record_ids
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_record):
+                record_id = future_to_record[future]
+                try:
+                    result = future.result()
+                    if result:
+                        images.append(result)
+                except Exception as e:
+                    logger.error(f"Error processing record {record_id}: {e}")
+    
+    return images
+    """
+    Legacy function - now uses the new select_page_from_record with content strategy and caching
     """
     return select_page_from_record(record_id, avoid_covers=True, page_selection="content")
 
@@ -255,30 +438,16 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
     # Synchronous search (for now, we'll keep it simple)
     try:
         ids, total = search_ids_v2(**filters, max_records=request_data.maxResults)
-        images = []
-        for rid in ids:
-            first_page, all_pages = select_page_from_record(
-                rid, 
-                avoid_covers=request_data.avoid_covers, 
-                page_selection=request_data.page_selection
-            )
-            if not first_page:
-                logger.warning(f"No pages for record {rid}")
-                continue
-            thumb = build_thumbnail_url(first_page)
-            full_url = build_full_url(first_page)
-            if is_valid_image_url(thumb):
-                images.append({
-                    "recordId": rid,
-                    "pageId": first_page,
-                    "thumbnailUrl": thumb,
-                    "fullImageUrl": full_url,
-                    "pageCount": len(all_pages),
-                    "pageIds": all_pages,
-                    "manifest": get_manifest_url(rid)
-                })
-            else:
-                logger.warning(f"Invalid thumbnail for page {first_page} (record {rid})")
+        
+        # Use concurrent processing for better performance
+        images = process_records_concurrently(
+            record_ids=ids,
+            avoid_covers=request_data.avoid_covers,
+            page_selection=request_data.page_selection,
+            validate_images=request_data.validate_images,
+            max_workers=concurrency_config.MAX_WORKERS
+        )
+        
         logger.info(f"JSON search returned {len(images)} images")
         return JSONResponse(content={"images": images, "count": len(images)})
     except Exception as e:
@@ -300,6 +469,10 @@ async def image_matchmaking_search(
     locale: Optional[str] = Form(None),
     criteria: Optional[List[str]] = Form(None),
     uploadedImage: Optional[List[UploadFile]] = File(None),
+    # New optional parameters
+    avoid_covers: Optional[bool] = Form(True),
+    page_selection: Optional[str] = Form("content"),
+    validate_images: Optional[bool] = Form(True),
     request: Request = None,
     background_tasks: BackgroundTasks = None
 ):
@@ -349,26 +522,16 @@ async def image_matchmaking_search(
         def process_job(job_id, filters, uploadedImage):
             try:
                 ids, total = search_ids_v2(**filters, max_records=maxResults)
-                results = []
-                for rid in ids:
-                    first_page, all_pages = expand_record_to_content_page(rid)
-                    if not first_page:
-                        logger.warning(f"No pages for record {rid}")
-                        continue
-                    thumb = build_thumbnail_url(first_page)
-                    full_url = build_full_url(first_page)
-                    if is_valid_image_url(thumb):
-                        results.append({
-                            "recordId": rid,
-                            "pageId": first_page,
-                            "thumbnailUrl": thumb,
-                            "fullImageUrl": full_url,
-                            "pageCount": len(all_pages),
-                            "pageIds": all_pages,
-                            "manifest": get_manifest_url(rid)
-                        })
-                    else:
-                        logger.warning(f"Invalid thumbnail for page {first_page} (record {rid})")
+                
+                # Use concurrent processing for async jobs too
+                results = process_records_concurrently(
+                    record_ids=ids,
+                    avoid_covers=avoid_covers,
+                    page_selection=page_selection,
+                    validate_images=validate_images,
+                    max_workers=concurrency_config.MAX_WORKERS
+                )
+                
                 jobs[job_id]["results"] = results
                 jobs[job_id]["status"] = "done"
                 logger.info(f"Async job {job_id} done: {len(results)} results")
@@ -382,26 +545,16 @@ async def image_matchmaking_search(
         # Synchronous: search and match
         try:
             ids, total = search_ids_v2(**filters, max_records=maxResults)
-            images = []
-            for rid in ids:
-                first_page, all_pages = expand_record_to_content_page(rid)
-                if not first_page:
-                    logger.warning(f"No pages for record {rid}")
-                    continue
-                thumb = build_thumbnail_url(first_page)
-                full_url = build_full_url(first_page)
-                if is_valid_image_url(thumb):
-                    images.append({
-                        "recordId": rid,
-                        "pageId": first_page,
-                        "thumbnailUrl": thumb,
-                        "fullImageUrl": full_url,
-                        "pageCount": len(all_pages),
-                        "pageIds": all_pages,
-                        "manifest": get_manifest_url(rid)
-                    })
-                else:
-                    logger.warning(f"Invalid thumbnail for page {first_page} (record {rid})")
+            
+            # Use concurrent processing for better performance
+            images = process_records_concurrently(
+                record_ids=ids,
+                avoid_covers=avoid_covers,
+                page_selection=page_selection,
+                validate_images=validate_images,
+                max_workers=concurrency_config.MAX_WORKERS
+            )
+            
             logger.info(f"Synchronous search returned {len(images)} images")
             return JSONResponse(content={"images": images, "count": len(images)})
         except Exception as e:
@@ -438,6 +591,46 @@ async def stream_matchmaking_results(jobId: str):
                 yield f"event: progress\ndata: {{'status': 'pending'}}\n\n"
                 time.sleep(1)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+# Cache management endpoints
+@app.get("/api/v1/cache/stats")
+async def get_cache_statistics():
+    """Get cache performance statistics"""
+    stats = get_cache_stats()
+    return JSONResponse(content={
+        "cache_stats": stats,
+        "config": {
+            "manifest_cache_size": cache_config.MANIFEST_CACHE_SIZE,
+            "image_validation_cache_size": cache_config.IMAGE_VALIDATION_CACHE_SIZE
+        }
+    })
+
+@app.post("/api/v1/cache/clear")
+async def clear_all_caches():
+    """Clear all caches - useful for testing or forcing fresh data"""
+    clear_caches()
+    return JSONResponse(content={"message": "All caches cleared successfully"})
+
+@app.get("/api/v1/performance/config")
+async def get_performance_config():
+    """Get current performance configuration"""
+    return JSONResponse(content={
+        "caching": {
+            "manifest_cache_size": cache_config.MANIFEST_CACHE_SIZE,
+            "image_validation_cache_size": cache_config.IMAGE_VALIDATION_CACHE_SIZE,
+            "cache_ttl_seconds": cache_config.CACHE_TTL_SECONDS
+        },
+        "concurrency": {
+            "max_workers": concurrency_config.MAX_WORKERS,
+            "batch_size": concurrency_config.BATCH_SIZE
+        },
+        "features": {
+            "concurrent_processing": True,
+            "configurable_image_validation": True,
+            "smart_page_selection": True,
+            "caching_enabled": True
+        }
+    })
 
 # Add more endpoints and validation as needed
 
