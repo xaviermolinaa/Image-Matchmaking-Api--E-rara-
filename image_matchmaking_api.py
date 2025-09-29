@@ -10,6 +10,7 @@ import os
 import shutil
 import mimetypes
 import time
+import threading
 import logging
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -85,6 +86,48 @@ def get_cache_stats():
 
 # In-memory job store for async jobs (for demo)
 jobs = {}
+jobs_lock = threading.Lock()
+
+def create_job() -> str:
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "pending",
+            "created": time.time(),
+            "started": None,
+            "finished": None,
+            "results": [],
+            "total_records": 0,
+            "processed_records": 0,
+            "progress": 0.0,
+            "error": None
+        }
+    return job_id
+
+def update_job_progress(job_id: str, *, processed: int = None, total: int = None, append_result=None):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return
+        if total is not None:
+            job["total_records"] = total
+        if processed is not None:
+            job["processed_records"] = processed
+        if append_result is not None:
+            job["results"].append(append_result)
+        total_val = job.get("total_records") or 0
+        proc_val = job.get("processed_records") or 0
+        job["progress"] = float(proc_val / total_val) if total_val else 0.0
+
+def finalize_job(job_id: str, status: str, error: str = None):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = status
+        job["finished"] = time.time()
+        if error:
+            job["error"] = error
 
 # Pydantic models for JSON requests
 class SearchCriteria(BaseModel):
@@ -435,7 +478,7 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
 
     logger.info(f"Search filters: {filters}")
 
-    # Synchronous search (for now, we'll keep it simple)
+    # Synchronous search (default)
     try:
         ids, total = search_ids_v2(**filters, max_records=request_data.maxResults)
         
@@ -453,6 +496,91 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
     except Exception as e:
         logger.error(f"JSON search error: {e}")
         return JSONResponse(status_code=500, content={"error": "INTERNAL_ERROR", "details": str(e)})
+
+
+@app.post("/api/v1/matchmaking/images/search/async")
+async def image_matchmaking_search_async(request_data: ImageMatchmakingRequest, background_tasks: BackgroundTasks):
+    """Submit an async matchmaking job. Returns jobId immediately so client can poll or stream."""
+    if request_data.operation != "IMAGE_MATCHMAKING":
+        return JSONResponse(status_code=400, content={"error": "VALIDATION_ERROR", "details": [{"field": "operation", "message": "Must be IMAGE_MATCHMAKING"}]})
+
+    # Parse & validate criteria
+    criteria_list = [c.dict() for c in (request_data.criteria or [])]
+    errors = validate_fields(criteria_list, request_data.from_date, request_data.until_date, None)
+    if errors:
+        return JSONResponse(status_code=400, content={"error": "VALIDATION_ERROR", "details": errors})
+    parsed_criteria = parse_criteria(criteria_list)
+
+    filters = {}
+    for c in parsed_criteria:
+        field = c.get("field", "").lower().strip()
+        value = c.get("value", "")
+        if field in ["title"]:
+            filters["title"] = value
+        elif field in ["author", "creator"]:
+            filters["author"] = value
+        elif field in ["place", "publication place", "origin place"]:
+            filters["place"] = value
+        elif field in ["publisher", "printer", "printer / publisher", "printer/publisher"]:
+            filters["publisher"] = value
+    if request_data.from_date:
+        filters["from_date"] = request_data.from_date
+    if request_data.until_date:
+        filters["until_date"] = request_data.until_date
+
+    job_id = create_job()
+    logger.info(f"Created async job {job_id} with filters={filters}")
+
+    def run_job():
+        with jobs_lock:
+            jobs[job_id]["status"] = "running"
+            jobs[job_id]["started"] = time.time()
+        try:
+            ids, total = search_ids_v2(**filters, max_records=request_data.maxResults)
+            update_job_progress(job_id, total=total or len(ids))
+
+            # Decide processing strategy
+            processed = 0
+            if len(ids) <= 2:
+                for rid in ids:
+                    res = process_single_record(rid, request_data.avoid_covers, request_data.page_selection, request_data.validate_images)
+                    if res:
+                        update_job_progress(job_id, append_result=res)
+                    processed += 1
+                    update_job_progress(job_id, processed=processed)
+            else:
+                # Concurrent
+                with ThreadPoolExecutor(max_workers=concurrency_config.MAX_WORKERS) as executor:
+                    future_to_record = {executor.submit(process_single_record, rid, request_data.avoid_covers, request_data.page_selection, request_data.validate_images): rid for rid in ids}
+                    for future in as_completed(future_to_record):
+                        rid = future_to_record[future]
+                        try:
+                            res = future.result()
+                            if res:
+                                update_job_progress(job_id, append_result=res)
+                        except Exception as e:
+                            logger.error(f"Async job {job_id} record {rid} error: {e}")
+                        processed += 1
+                        update_job_progress(job_id, processed=processed)
+            finalize_job(job_id, "done")
+            logger.info(f"Async job {job_id} finished with {len(jobs[job_id]['results'])} results")
+        except Exception as e:
+            logger.exception(f"Async job {job_id} failed: {e}")
+            finalize_job(job_id, "error", error=str(e))
+
+    background_tasks.add_task(run_job)
+    return JSONResponse(content={"jobId": job_id, "status": "pending"})
+
+
+@app.get("/api/v1/matchmaking/images/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "NOT_FOUND", "details": [{"field": "jobId", "message": "Job not found"}]})
+    # Copy without internal references
+    safe = {k: v for k, v in job.items() if k not in []}
+    safe["count"] = len(job.get("results", []))
+    return JSONResponse(content=safe)
 
 @app.post("/api/v1/matchmaking/images/search/form")
 async def image_matchmaking_search(
