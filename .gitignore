@@ -1,0 +1,10 @@
+# Vocab tree model artifacts
+The database code/vocab_db/*
+!The database code/vocab_db/README.md
+
+# Large serialized files
+*.pkl
+*.pkl.gz
+*.npz
+*.idx
+*.bin
