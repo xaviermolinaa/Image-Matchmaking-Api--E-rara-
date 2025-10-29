@@ -1,5 +1,6 @@
 
 import requests
+import json
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,11 +101,13 @@ def create_job() -> str:
             "total_records": 0,
             "processed_records": 0,
             "progress": 0.0,
-            "error": None
+            "error": None,
+            "totalFound": None,
+            "warnings": []
         }
     return job_id
 
-def update_job_progress(job_id: str, *, processed: int = None, total: int = None, append_result=None):
+def update_job_progress(job_id: str, *, processed: int = None, total: int = None, append_result=None, warnings=None):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
@@ -115,6 +118,9 @@ def update_job_progress(job_id: str, *, processed: int = None, total: int = None
             job["processed_records"] = processed
         if append_result is not None:
             job["results"].append(append_result)
+        if warnings:
+            job.setdefault("warnings", [])
+            job["warnings"].extend(warnings)
         total_val = job.get("total_records") or 0
         proc_val = job.get("processed_records") or 0
         job["progress"] = float(proc_val / total_val) if total_val else 0.0
@@ -144,6 +150,7 @@ class ImageMatchmakingRequest(BaseModel):
     from_date: Optional[str] = None
     until_date: Optional[str] = None
     maxResults: Optional[int] = 10
+    max_records: Optional[int] = None
     pageSize: Optional[int] = None
     includeMetadata: Optional[bool] = True
     responseFormat: Optional[str] = "json"
@@ -289,30 +296,14 @@ def select_page_from_record(record_id: str, avoid_covers: bool = True, page_sele
         return selected_page, pages
     
     # Default: "content" strategy
-    # Calculate skip ranges to avoid covers
-    skip_start = min(3, total_pages // 4) if total_pages > 10 else 2
-    skip_end = min(2, total_pages // 8) if total_pages > 10 else 1
-    
-    # Content pages are in the middle section
-    content_start = skip_start
-    content_end = total_pages - skip_end
-    
-    if content_start >= content_end:
-        # Fallback: if our logic is too aggressive, just skip the first page
-        content_start = 1
-        content_end = total_pages
-    
-    # Select a page from the content area (prefer pages closer to 1/3 through the document)
-    content_pages = pages[content_start:content_end]
-    
-    if content_pages:
-        # Pick a page roughly 1/3 through the content section for better variety
-        target_index = len(content_pages) // 3
-        selected_page = content_pages[target_index]
-        logger.info(f"Record {record_id}: Selected page {content_start + target_index + 1} of {total_pages} (skipping {skip_start} front pages)")
+    # Skip only the first page (likely cover/title page)
+    # Simply return page 2 (index 1)
+    if total_pages >= 2:
+        selected_page = pages[1]  # Page 2
+        logger.info(f"Record {record_id}: Selected page 2 of {total_pages} (avoiding cover page)")
         return selected_page, pages
     
-    # Ultimate fallback
+    # Ultimate fallback: return first page if only 1 page exists
     return pages[0], pages
 
 # Keep the old function for backward compatibility but use the new logic
@@ -337,6 +328,8 @@ def process_single_record(record_id: str, avoid_covers: bool = True, page_select
         Image information dictionary or None if processing failed
     """
     try:
+        data = get_cached_page_ids(record_id)
+        metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
         first_page, all_pages = select_page_from_record(record_id, avoid_covers, page_selection)
         if not first_page:
             logger.warning(f"No pages for record {record_id}")
@@ -354,15 +347,63 @@ def process_single_record(record_id: str, avoid_covers: bool = True, page_select
             logger.debug(f"Skipping image validation for {thumb} (validate_images=False)")
         
         if is_valid:
-            return {
+            manifest_url = get_manifest_url(record_id)
+            
+            # Build comprehensive result with all available metadata
+            result = {
+                "id": record_id,
                 "recordId": record_id,
                 "pageId": first_page,
-                "thumbnailUrl": thumb,
-                "fullImageUrl": full_url,
-                "pageCount": len(all_pages),
                 "pageIds": all_pages,
-                "manifest": get_manifest_url(record_id)
+                "pageCount": len(all_pages),
+                "thumbnailUrl": thumb,
+                "thumbUrl": thumb,
+                "fullImageUrl": full_url,
+                "fullUrl": full_url,
+                "url": full_url,
+                "manifest": manifest_url,
+                "metadata": {}
             }
+            
+            # Extract and promote common metadata fields to both top-level and metadata object
+            if isinstance(metadata, dict):
+                # Copy all metadata to nested object
+                result["metadata"] = metadata.copy()
+                
+                # Promote key fields to top level for UI convenience
+                title = metadata.get("title") or metadata.get("Title") or metadata.get("label")
+                if title:
+                    result["title"] = title
+                    result["metadata"]["title"] = title
+                
+                # Extract other common fields
+                author = metadata.get("Author") or metadata.get("Creator") or metadata.get("author")
+                if author:
+                    result["author"] = author
+                    result["metadata"]["author"] = author
+                
+                date = metadata.get("Date") or metadata.get("Publication date") or metadata.get("date")
+                if date:
+                    result["date"] = date
+                    result["metadata"]["date"] = date
+                
+                place = metadata.get("Place") or metadata.get("Publication place") or metadata.get("place")
+                if place:
+                    result["place"] = place
+                    result["metadata"]["place"] = place
+                
+                publisher = metadata.get("Publisher") or metadata.get("Printer / Publisher") or metadata.get("publisher")
+                if publisher:
+                    result["publisher"] = publisher
+                    result["metadata"]["publisher"] = publisher
+                
+                # Include raw label if exists
+                label = metadata.get("label")
+                if label and not title:
+                    result["title"] = label
+                    result["metadata"]["title"] = label
+            
+            return result
         else:
             logger.warning(f"Invalid thumbnail for page {first_page} (record {record_id})")
             return None
@@ -465,7 +506,7 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
         field_lower = field.lower().strip()
         if field_lower in ["title"]:
             filters["title"] = value
-        elif field_lower in ["author", "creator"]:
+        elif field_lower in ["author", "creator", "author or collaborator", "collaborator"]:
             filters["author"] = value
         elif field_lower in ["place", "publication place", "origin place"]:
             filters["place"] = value
@@ -480,7 +521,8 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
 
     # Synchronous search (default)
     try:
-        ids, total = search_ids_v2(**filters, max_records=request_data.maxResults)
+        effective_max = request_data.max_records or request_data.maxResults
+        ids, total = search_ids_v2(**filters, max_records=effective_max)
         
         # Use concurrent processing for better performance
         images = process_records_concurrently(
@@ -491,8 +533,16 @@ async def image_matchmaking_search_json(request_data: ImageMatchmakingRequest):
             max_workers=concurrency_config.MAX_WORKERS
         )
         
-        logger.info(f"JSON search returned {len(images)} images")
-        return JSONResponse(content={"images": images, "count": len(images)})
+        response_payload = {
+            "images": images,
+            "count": len(images),
+            "totalFound": total if total is not None else len(ids)
+        }
+        if not images:
+            response_payload["warnings"] = [{"code": "NO_RESULTS", "message": "No images found for the given criteria."}]
+
+        logger.info(f"JSON search returned {len(images)} images (totalFound={total})")
+        return JSONResponse(content=response_payload)
     except Exception as e:
         logger.error(f"JSON search error: {e}")
         return JSONResponse(status_code=500, content={"error": "INTERNAL_ERROR", "details": str(e)})
@@ -536,8 +586,9 @@ async def image_matchmaking_search_async(request_data: ImageMatchmakingRequest, 
             jobs[job_id]["status"] = "running"
             jobs[job_id]["started"] = time.time()
         try:
-            ids, total = search_ids_v2(**filters, max_records=request_data.maxResults)
-            update_job_progress(job_id, total=total or len(ids))
+            effective_max_async = request_data.max_records or request_data.maxResults
+            ids, total = search_ids_v2(**filters, max_records=effective_max_async)
+            update_job_progress(job_id, total=total if total is not None else len(ids))
 
             # Decide processing strategy
             processed = 0
@@ -562,8 +613,13 @@ async def image_matchmaking_search_async(request_data: ImageMatchmakingRequest, 
                             logger.error(f"Async job {job_id} record {rid} error: {e}")
                         processed += 1
                         update_job_progress(job_id, processed=processed)
+            total_found = total if total is not None else len(ids)
+            with jobs_lock:
+                jobs[job_id]["totalFound"] = total_found
+                if not jobs[job_id]["results"]:
+                    jobs[job_id]["warnings"] = [{"code": "NO_RESULTS", "message": "No images found for the given criteria."}]
             finalize_job(job_id, "done")
-            logger.info(f"Async job {job_id} finished with {len(jobs[job_id]['results'])} results")
+            logger.info(f"Async job {job_id} finished with {len(jobs[job_id]['results'])} results (totalFound={total_found})")
         except Exception as e:
             logger.exception(f"Async job {job_id} failed: {e}")
             finalize_job(job_id, "error", error=str(e))
@@ -591,6 +647,7 @@ async def image_matchmaking_search(
     from_date: Optional[str] = Form(None),
     until_date: Optional[str] = Form(None),
     maxResults: Optional[int] = Form(None),
+    max_records: Optional[int] = Form(None),
     pageSize: Optional[int] = Form(None),
     includeMetadata: Optional[bool] = Form(True),
     responseFormat: Optional[str] = Form("json"),
@@ -641,15 +698,17 @@ async def image_matchmaking_search(
     logger.info(f"Search filters: {filters}")
 
     # Synchronous or async
-    if maxResults and maxResults > 100:
+    effective_max = max_records or maxResults
+
+    if effective_max and effective_max > 100:
         # Async job
         job_id = str(uuid.uuid4())
         jobs[job_id] = {"status": "pending", "results": []}
         logger.info(f"Starting async job: {job_id}")
         # Launch background task
-        def process_job(job_id, filters, uploadedImage):
+        def process_job(job_id, filters, uploadedImage, max_records_value):
             try:
-                ids, total = search_ids_v2(**filters, max_records=maxResults)
+                ids, total = search_ids_v2(**filters, max_records=max_records_value)
                 
                 # Use concurrent processing for async jobs too
                 results = process_records_concurrently(
@@ -667,12 +726,12 @@ async def image_matchmaking_search(
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = str(e)
                 logger.error(f"Async job {job_id} error: {e}")
-        background_tasks.add_task(process_job, job_id, filters, uploadedImage)
+        background_tasks.add_task(process_job, job_id, filters, uploadedImage, effective_max)
         return JSONResponse(content={"jobId": job_id, "status": "pending"})
     else:
         # Synchronous: search and match
         try:
-            ids, total = search_ids_v2(**filters, max_records=maxResults)
+            ids, total = search_ids_v2(**filters, max_records=effective_max)
             
             # Use concurrent processing for better performance
             images = process_records_concurrently(
@@ -682,9 +741,16 @@ async def image_matchmaking_search(
                 validate_images=validate_images,
                 max_workers=concurrency_config.MAX_WORKERS
             )
+            response_payload = {
+                "images": images,
+                "count": len(images),
+                "totalFound": total if total is not None else len(ids)
+            }
+            if not images:
+                response_payload["warnings"] = [{"code": "NO_RESULTS", "message": "No images found for the given criteria."}]
             
-            logger.info(f"Synchronous search returned {len(images)} images")
-            return JSONResponse(content={"images": images, "count": len(images)})
+            logger.info(f"Synchronous search returned {len(images)} images (totalFound={total})")
+            return JSONResponse(content=response_payload)
         except Exception as e:
             logger.error(f"Synchronous search error: {e}")
             return JSONResponse(status_code=500, content={"error": "INTERNAL_ERROR", "details": str(e)})
@@ -696,7 +762,15 @@ async def get_matchmaking_results(jobId: str, pageToken: Optional[str] = None):
     if not job:
         return JSONResponse(status_code=404, content={"error": "NOT_FOUND", "details": [{"field": "jobId", "message": "Job not found"}]})
     # For demo, return job results
-    return JSONResponse(content={"images": job.get("results", []), "status": job.get("status", "pending")})
+    images = job.get("results", [])
+    payload = {
+        "images": images,
+        "count": len(images),
+        "status": job.get("status", "pending"),
+        "totalFound": job.get("totalFound"),
+        "warnings": job.get("warnings", [])
+    }
+    return JSONResponse(content=payload)
 
 # SSE streaming endpoint
 @app.get("/api/v1/matchmaking/images/stream")
@@ -709,14 +783,27 @@ async def stream_matchmaking_results(jobId: str):
                 break
             if job["status"] == "done":
                 for img in job["results"]:
-                    yield f"event: match\ndata: {img}\n\n"
-                yield f"event: done\ndata: {{'status': 'done'}}\n\n"
+                    yield f"event: match\ndata: {json.dumps(img)}\n\n"
+                summary = {
+                    "status": "done",
+                    "count": len(job["results"]),
+                    "totalFound": job.get("totalFound"),
+                    "warnings": job.get("warnings", [])
+                }
+                yield f"event: done\ndata: {json.dumps(summary)}\n\n"
                 break
             elif job["status"] == "error":
-                yield f"event: error\ndata: {{'error': '{job.get('error', 'Unknown')}'}}\n\n"
+                error_payload = {"error": job.get("error", "Unknown"), "status": "error"}
+                yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
                 break
             else:
-                yield f"event: progress\ndata: {{'status': 'pending'}}\n\n"
+                progress_payload = {
+                    "status": job.get("status", "pending"),
+                    "progress": job.get("progress", 0.0),
+                    "processed": job.get("processed_records", 0),
+                    "total": job.get("total_records", 0)
+                }
+                yield f"event: progress\ndata: {json.dumps(progress_payload)}\n\n"
                 time.sleep(1)
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

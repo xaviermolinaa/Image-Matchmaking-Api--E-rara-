@@ -6,12 +6,14 @@ import logging
 from typing import List, Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import numpy as np
 import cv2
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from import_db import load_vt_model, patch_spatial_verify_for_tuples
 # --- Optional FAISS for faster/more robust k-means ---
@@ -23,9 +25,9 @@ except Exception:
     FAISS_AVAILABLE = False
 
 
-app = FastAPI(title="Image+Object API", version="1.1.0")
+app = FastAPI(title="Visual Search API", version="1.1.0")
 
-logger = logging.getLogger("image_object_api")
+logger = logging.getLogger("visual_search_api")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 # Global DB handle populated at startup
@@ -38,6 +40,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Exception handler for better error logging
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error in {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "path": str(request.url.path)}
+    )
 
 # ---------- Feature Extraction ----------
 def extract_sift(gray_img, nfeatures=500):
@@ -188,28 +199,54 @@ async def process_image_and_dataset(
       { "images": [ { "recordId": "123", "pageIds": ["456","457"] } ] }, ...
     ]
     """
+    logger.info(f"Received /process request - image: {image.filename}, dataset size: {len(dataset)} bytes")
+    
     # Decode dataset JSON
     try:
         dataset_obj = json.loads(dataset)
         if not isinstance(dataset_obj, list):
             raise ValueError("Dataset root must be a list")
+        
+        # Count images in dataset
+        total_images = sum(len(obj.get('images', [])) for obj in dataset_obj)
+        logger.info(f"Dataset contains {len(dataset_obj)} objects with {total_images} total images")
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON in dataset: {e}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid dataset JSON: {e}")
+        logger.error(f"Dataset parsing error: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid dataset: {e}")
 
     # Read image bytes
     try:
         contents = await image.read()
+        logger.info(f"Image size: {len(contents)} bytes")
+        
         np_buf = np.frombuffer(contents, np.uint8)
         gray = cv2.imdecode(np_buf, cv2.IMREAD_GRAYSCALE)
+        
         if gray is None:
             raise ValueError("Could not decode image")
+        
+        logger.info(f"Image decoded successfully: {gray.shape}")
+        
     except Exception as e:
+        logger.error(f"Image decode error: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
     # Query DB
+    logger.info("Starting visual search query...")
     matches = query_db(gray, topk=50)
     page_ids = [m[0] for m in matches]  # assuming image ids correspond to page ids
+    
+    logger.info(f"Visual search found {len(matches)} matches, top page IDs: {page_ids[:3]}")
+    
+    # Map page IDs to record IDs
     record_ids = get_record_ids_by_page_ids(dataset=dataset_obj, page_ids=page_ids, unique=True)
+    
+    logger.info(f"Mapped to {len(record_ids)} unique record IDs: {record_ids[:5]}")
+    
     return ProcessResponse(
         record_ids=record_ids,
         page_ids=page_ids,
@@ -241,10 +278,18 @@ def _load_model():
         db = load_vt_model('vocab_db')
         db = patch_spatial_verify_for_tuples(db)
         logger.info("Model loaded successfully")
+        logger.info(f"Database contains {len(db.image_meta)} indexed pages")
     except Exception as e:
         logger.exception("Failed to load model: %s", e)
 
 
 if __name__ == "__main__":
-    # Manual run: uvicorn "app_server:app" --reload --port 8001
-    uvicorn.run("app_server:app", host="127.0.0.1", port=8001, reload=True)
+    # Manual run
+    # Note: To handle large datasets, the frontend should compress the JSON
+    # or the dataset should be sent via a different endpoint
+    uvicorn.run(
+        "app_server:app", 
+        host="127.0.0.1", 
+        port=8001, 
+        reload=True
+    )
